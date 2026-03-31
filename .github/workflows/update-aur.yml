@@ -1,0 +1,93 @@
+name: Update AUR Package
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check upstream version
+        id: check
+        run: |
+          UPSTREAM=$(curl -s "https://archlinux.org/packages/core/x86_64/wpa_supplicant/json/" | jq -r '.pkgver')
+          CURRENT=$(grep '^pkgver=' PKGBUILD | cut -d= -f2)
+          echo "upstream=$UPSTREAM" >> "$GITHUB_OUTPUT"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          if [ "$UPSTREAM" != "$CURRENT" ]; then
+            echo "update_needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "update_needed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sync with official package
+        if: steps.check.outputs.update_needed == 'true'
+        run: |
+          git clone --depth 1 \
+            https://gitlab.archlinux.org/archlinux/packaging/packages/wpa_supplicant.git \
+            /tmp/official
+
+          # Copy patches (remove old ones first)
+          rm -f 000*.patch
+          cp /tmp/official/000*.patch . 2>/dev/null || true
+
+          # Copy install file
+          cp /tmp/official/wpa_supplicant.install .
+
+          # Copy config and enable WEP
+          cp /tmp/official/wpa_supplicant_config .
+          sed -i 's/^#CONFIG_WEP=y/CONFIG_WEP=y/' wpa_supplicant_config
+
+          # Start from official PKGBUILD
+          cp /tmp/official/PKGBUILD .
+
+          # Apply our modifications
+          sed -i '1,4d' PKGBUILD
+          sed -i '1i # Maintainer: clalos <clalos at users dot noreply dot github dot com>' PKGBUILD
+          sed -i 's/^pkgname=wpa_supplicant$/pkgname=wpa_supplicant-wep2/' PKGBUILD
+          sed -i "s/^pkgdesc=.*/pkgdesc='A utility providing key negotiation for WPA wireless networks (with WEP support)'/" PKGBUILD
+          sed -i 's/^pkgrel=.*/pkgrel=1/' PKGBUILD
+          sed -i "/^install=/i provides=('wpa_supplicant')\nconflicts=('wpa_supplicant')" PKGBUILD
+
+          # Fix source-tree paths (the hostap subdirectory is always called wpa_supplicant)
+          sed -i 's|cp ../wpa_supplicant_config $pkgname/.config|cp ../wpa_supplicant_config wpa_supplicant/.config|' PKGBUILD
+          sed -i 's|cd hostap/$pkgname|cd hostap/wpa_supplicant|g' PKGBUILD
+
+      - name: Update checksums and generate .SRCINFO
+        if: steps.check.outputs.update_needed == 'true'
+        uses: hapakaien/archlinux-package-action@v2
+        with:
+          updpkgsums: true
+          srcinfo: true
+
+      - name: Commit and push to GitHub
+        if: steps.check.outputs.update_needed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m "feat: update to ${{ steps.check.outputs.upstream }}"
+          git push
+
+      - name: Deploy to AUR
+        if: steps.check.outputs.update_needed == 'true'
+        uses: KSXGitHub/github-actions-deploy-aur@v3.0.1
+        with:
+          pkgname: wpa_supplicant-wep2
+          pkgbuild: ./PKGBUILD
+          assets: |
+            .SRCINFO
+            wpa_supplicant_config
+            wpa_supplicant.install
+            000*.patch
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to ${{ steps.check.outputs.upstream }}"
+          ssh_keyscan_types: rsa,ecdsa,ed25519
